@@ -32,9 +32,28 @@ from ..utils import slugify
 from .metadata_addon import MetadataAddonClient, MetadataMatch
 from .openrouter import OpenRouterClient
 from .openai import OpenAIClient
-from .trakt import HistoryBatch, TraktClient
+from .trakt import HistoryBatch, TraktAuthExpired, TraktClient
 
 logger = logging.getLogger(__name__)
+
+# Trakt access tokens last 7 days; renew a day early so a refresh never races expiry.
+_TRAKT_TOKEN_REFRESH_MARGIN = timedelta(days=1)
+
+
+def _trakt_token_times(
+    created_at: object, expires_in: object
+) -> tuple[datetime, datetime | None]:
+    """Return when a Trakt token was issued and when it expires (naive UTC)."""
+
+    try:
+        issued_at = datetime.utcfromtimestamp(int(created_at))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError, OSError):
+        issued_at = datetime.utcnow()
+    try:
+        lifetime = int(expires_in)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return issued_at, None
+    return issued_at, issued_at + timedelta(seconds=lifetime)
 
 
 class ManifestConfig(BaseModel):
@@ -115,6 +134,21 @@ class ManifestConfig(BaseModel):
         default=None,
         validation_alias=AliasChoices("traktAccessToken", "traktToken"),
     )
+    trakt_refresh_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("traktRefreshToken"),
+    )
+    # Trakt's created_at / expires_in for the access token, in seconds.
+    trakt_token_created_at: int | None = Field(
+        default=None,
+        ge=0,
+        validation_alias=AliasChoices("traktTokenCreatedAt"),
+    )
+    trakt_token_expires_in: int | None = Field(
+        default=None,
+        ge=0,
+        validation_alias=AliasChoices("traktTokenExpiresIn"),
+    )
     metadata_addon_url: HttpUrl | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -192,6 +226,7 @@ class ManifestConfig(BaseModel):
         "manifest_name",
         "trakt_client_id",
         "trakt_access_token",
+        "trakt_refresh_token",
         "metadata_addon_url",
         mode="before",
     )
@@ -245,6 +280,9 @@ class ProfileState:
     # OpenAI credentials
     openai_api_key: str = ""
     openai_model: str = ""
+    trakt_refresh_token: str | None = None
+    trakt_token_issued_at: datetime | None = None
+    trakt_token_expires_at: datetime | None = None
 
 
 @dataclass
@@ -291,6 +329,12 @@ class ProfileStatus:
             ),
             "nextRefreshAt": (
                 self.state.next_refresh_at.isoformat() if self.state.next_refresh_at else None
+            ),
+            "traktTokenExpiresAt": (
+                # Stored as naive UTC; mark it so browsers don't read local time.
+                self.state.trakt_token_expires_at.isoformat() + "Z"
+                if self.state.trakt_token_expires_at
+                else None
             ),
             "hasCatalogs": self.has_catalogs,
             "needsRefresh": self.needs_refresh,
@@ -353,6 +397,7 @@ class CatalogService:
             settings.catalog_keys, fallback=self._all_catalog_keys
         )
         self._locks: dict[str, asyncio.Lock] = {}
+        self._token_locks: dict[str, asyncio.Lock] = {}
         self._refresh_task: asyncio.Task[None] | None = None
         self._refresh_poll_seconds = 60
         self._refresh_jobs: dict[str, asyncio.Task[None]] = {}
@@ -465,6 +510,21 @@ class CatalogService:
 
     async def _refresh_due_profiles(self) -> None:
         now = datetime.utcnow()
+        # Renew sign-ins independently of the catalog cadence, which may be
+        # longer than the time left on a token.
+        async with self._session_factory() as session:
+            stmt = select(Profile.id).where(
+                Profile.trakt_refresh_token.is_not(None),
+                Profile.trakt_token_expires_at.is_not(None),
+                Profile.trakt_token_expires_at <= now + _TRAKT_TOKEN_REFRESH_MARGIN,
+            )
+            result = await session.execute(stmt)
+            renewal_ids = [row[0] for row in result.all()]
+        for profile_id in renewal_ids:
+            state = await self._load_profile_state(profile_id)
+            if state is not None:
+                await self._ensure_fresh_trakt_token(state)
+
         async with self._session_factory() as session:
             stmt = select(Profile.id).where(
                 Profile.next_refresh_at.is_not(None),
@@ -523,6 +583,7 @@ class CatalogService:
         self._schedule_refresh(state, force=force)
 
     async def _refresh_catalogs(self, state: ProfileState) -> None:
+        state = await self._ensure_fresh_trakt_token(state)
         logger.info(
             "Refreshing catalogs for profile %s via model %s",
             state.id,
@@ -773,7 +834,68 @@ class CatalogService:
             trakt_history_snapshot=getattr(
                 profile, "trakt_history_snapshot", None
             ),
+            trakt_refresh_token=getattr(profile, "trakt_refresh_token", None),
+            trakt_token_issued_at=getattr(profile, "trakt_token_issued_at", None),
+            trakt_token_expires_at=getattr(profile, "trakt_token_expires_at", None),
         )
+
+    async def _ensure_fresh_trakt_token(self, state: ProfileState) -> ProfileState:
+        """Renew the profile's Trakt sign-in when it is close to expiring.
+
+        Refresh tokens are single-use, so the new pair is saved before anything
+        uses it and concurrent callers share one renewal per profile.
+        """
+
+        if not self._trakt_token_due(state):
+            return state
+
+        lock = self._token_locks.setdefault(state.id, asyncio.Lock())
+        async with lock:
+            latest = await self._load_profile_state(state.id) or state
+            if not self._trakt_token_due(latest):
+                return latest
+            try:
+                data = await self._trakt.refresh_access_token(
+                    latest.trakt_refresh_token or "",
+                    client_id=latest.trakt_client_id,
+                )
+            except TraktAuthExpired:
+                logger.warning(
+                    "Trakt sign-in for profile %s expired; sign in again from /config",
+                    latest.id,
+                )
+                async with self._session_factory() as session:
+                    profile = await session.get(Profile, latest.id)
+                    if profile is not None:
+                        profile.trakt_refresh_token = None
+                        await session.commit()
+                return await self._load_profile_state(latest.id) or latest
+            if data is None:
+                return latest
+
+            issued_at, expires_at = _trakt_token_times(
+                data.get("created_at"), data.get("expires_in")
+            )
+            async with self._session_factory() as session:
+                profile = await session.get(Profile, latest.id)
+                if profile is None:
+                    return latest
+                profile.trakt_access_token = data["access_token"]
+                profile.trakt_refresh_token = (
+                    data.get("refresh_token") or profile.trakt_refresh_token
+                )
+                profile.trakt_token_issued_at = issued_at
+                profile.trakt_token_expires_at = expires_at
+                await session.commit()
+            logger.info("Renewed Trakt sign-in for profile %s", latest.id)
+            return await self._load_profile_state(latest.id) or latest
+
+    @staticmethod
+    def _trakt_token_due(state: ProfileState) -> bool:
+        if not (state.trakt_refresh_token and state.trakt_token_expires_at):
+            return False
+        remaining = state.trakt_token_expires_at - datetime.utcnow()
+        return remaining <= _TRAKT_TOKEN_REFRESH_MARGIN
 
     async def _gather_trakt_history_metadata(
         self,
@@ -941,6 +1063,7 @@ class CatalogService:
         if refreshed_at and datetime.utcnow() - refreshed_at < timedelta(hours=12):
             return state
 
+        state = await self._ensure_fresh_trakt_token(state)
         movie_batch, show_batch = await asyncio.gather(
             self._trakt.fetch_history(
                 "movies",
@@ -1233,6 +1356,8 @@ class CatalogService:
                     created_at=now,
                     updated_at=now,
                 )
+                if config.trakt_access_token:
+                    self._apply_incoming_trakt_tokens(profile, config)
                 session.add(profile)
                 created = True
                 refresh_required = True
@@ -1296,8 +1421,12 @@ class CatalogService:
                 if config.trakt_client_id is not None and config.trakt_client_id != profile.trakt_client_id:
                     profile.trakt_client_id = config.trakt_client_id
                     refresh_required = True
-                if config.trakt_access_token is not None and config.trakt_access_token != profile.trakt_access_token:
-                    profile.trakt_access_token = config.trakt_access_token
+                if (
+                    config.trakt_access_token is not None
+                    and config.trakt_access_token != profile.trakt_access_token
+                    and self._incoming_trakt_token_is_newer(profile, config)
+                ):
+                    self._apply_incoming_trakt_tokens(profile, config)
                     refresh_required = True
                 # Ignore any client-provided Trakt history limit; always use full history
                 if config.metadata_addon_url is not None:
@@ -1314,6 +1443,49 @@ class CatalogService:
             state = self._profile_to_state(profile)
 
         return ProfileContext(state=state, force_refresh=refresh_required or created)
+
+    @staticmethod
+    def _incoming_trakt_token_is_newer(
+        profile: Profile, config: ManifestConfig
+    ) -> bool:
+        """Whether a token sent by a browser should replace the stored one.
+
+        The browser keeps the tokens from its sign-in, but once the server has
+        renewed them that copy is stale (and its refresh token already spent).
+        Only a token issued after the stored one, i.e. a new sign-in, wins.
+        """
+
+        stored_issued_at = getattr(profile, "trakt_token_issued_at", None)
+        if config.trakt_token_created_at is None:
+            # A pasted token with no issue time; only replace unmanaged tokens.
+            return not getattr(profile, "trakt_refresh_token", None)
+        if stored_issued_at is None:
+            return True
+        incoming_issued_at, _ = _trakt_token_times(
+            config.trakt_token_created_at, None
+        )
+        return incoming_issued_at > stored_issued_at
+
+    def _apply_incoming_trakt_tokens(
+        self, profile: Profile, config: ManifestConfig
+    ) -> None:
+        # Sign-ins go through this server's Trakt app, so the tokens belong to
+        # its current client ID even if TRAKT_CLIENT_ID changed since the
+        # profile was created.
+        client_id = config.trakt_client_id or self._settings.trakt_client_id
+        if client_id:
+            profile.trakt_client_id = client_id
+        profile.trakt_access_token = config.trakt_access_token
+        profile.trakt_refresh_token = config.trakt_refresh_token
+        if config.trakt_token_created_at is None:
+            profile.trakt_token_issued_at = None
+            profile.trakt_token_expires_at = None
+            return
+        issued_at, expires_at = _trakt_token_times(
+            config.trakt_token_created_at, config.trakt_token_expires_in
+        )
+        profile.trakt_token_issued_at = issued_at
+        profile.trakt_token_expires_at = expires_at
 
     async def resolve_profile(self, config: ManifestConfig) -> ProfileContext:
         """Expose profile resolution without triggering catalog refreshes."""

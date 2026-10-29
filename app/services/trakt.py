@@ -16,6 +16,10 @@ from ..config import Settings
 logger = logging.getLogger(__name__)
 
 
+class TraktAuthExpired(Exception):
+    """Raised when Trakt reports that a sign-in can no longer be renewed."""
+
+
 @dataclass(slots=True)
 class HistoryBatch:
     """Container for a page of history items and the reported total size."""
@@ -678,6 +682,59 @@ class TraktClient:
         if not isinstance(data, dict):
             logger.warning("Unexpected Trakt user profile structure")
             return {}
+        return data
+
+    async def refresh_access_token(
+        self,
+        refresh_token: str,
+        *,
+        client_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Exchange a refresh token for a new token pair.
+
+        Returns ``None`` on a transient failure (the caller can retry later)
+        and raises ``TraktAuthExpired`` when Trakt rejects the refresh token.
+        """
+
+        resolved_client_id = client_id or self._settings.trakt_client_id
+        auth_url = str(self._settings.trakt_auth_url).rstrip("/")
+        try:
+            response = await self._client.post(
+                f"{auth_url}/oauth/token",
+                json={
+                    "refresh_token": refresh_token,
+                    "client_id": resolved_client_id,
+                    "redirect_uri": self._settings.trakt_redirect_uri,
+                    "grant_type": "refresh_token",
+                },
+                headers={
+                    "trakt-api-version": "2",
+                    "trakt-api-key": resolved_client_id or "",
+                    "User-Agent": f"{self._settings.app_name} (aiopicks)",
+                },
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Could not reach Trakt to renew a sign-in: %s", exc)
+            return None
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if response.status_code >= 400:
+            if data.get("error") == "invalid_grant":
+                raise TraktAuthExpired(data.get("error_description") or "invalid_grant")
+            logger.warning(
+                "Trakt refused to renew a sign-in (%s): %s",
+                response.status_code,
+                data.get("error_description") or data.get("error") or response.text,
+            )
+            return None
+        if not data.get("access_token"):
+            logger.warning("Trakt renewed a sign-in without returning an access token")
+            return None
         return data
 
     @staticmethod

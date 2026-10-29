@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from textwrap import dedent
-from urllib.parse import urlparse
 
 from .config import Settings
 from .stable_catalogs import STABLE_CATALOGS
@@ -322,6 +321,13 @@ CONFIG_TEMPLATE = dedent(
             letter-spacing: 0.05em;
             text-transform: uppercase;
         }
+        .trakt-code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 1.4rem;
+            font-weight: 700;
+            letter-spacing: 0.2em;
+            color: var(--text-primary);
+        }
         .hidden {
             display: none !important;
         }
@@ -370,6 +376,10 @@ CONFIG_TEMPLATE = dedent(
                 <h2>Connect Trakt</h2>
                 <p class="description">Sign in seamlessly—no device codes or copy/paste hoops required.</p>
                 <p class="muted" id="trakt-hint"></p>
+                <div class="trakt-device hidden" id="trakt-device">
+                    <p>Open <a id="trakt-device-link" href="https://auth.trakt.tv/activate" target="_blank" rel="noopener">auth.trakt.tv/activate</a> and enter this code:</p>
+                    <div class="trakt-code" id="trakt-device-code"></div>
+                </div>
                 <div class="actions">
                     <button id="trakt-login" type="button">Sign in with Trakt</button>
                     <button id="trakt-disconnect" type="button" class="secondary hidden">Disconnect</button>
@@ -521,14 +531,13 @@ CONFIG_TEMPLATE = dedent(
             const traktStatsSummary = document.getElementById('trakt-stats-summary');
             const traktStatsUpdated = document.getElementById('trakt-stats-updated');
             const traktLoginAvailable = Boolean(defaults.traktLoginAvailable);
-            const traktCallbackOrigin = (defaults.traktCallbackOrigin || '').trim();
-            const traktOrigins = [window.location.origin];
-            if (traktCallbackOrigin && !traktOrigins.includes(traktCallbackOrigin)) {
-                traktOrigins.push(traktCallbackOrigin);
-            }
+            const traktDeviceBlock = document.getElementById('trakt-device');
+            const traktDeviceLink = document.getElementById('trakt-device-link');
+            const traktDeviceCode = document.getElementById('trakt-device-code');
 
-            const traktAuth = { accessToken: '', refreshToken: '' };
+            const traktAuth = { accessToken: '', refreshToken: '', createdAt: 0, expiresIn: 0 };
             let traktPending = false;
+            let traktDevice = null;
             let copyTimeout = null;
             let historyLimitTouched = false;
             let generationRetriesTouched = false;
@@ -903,35 +912,125 @@ CONFIG_TEMPLATE = dedent(
                 }
                 traktPending = true;
                 updateTraktUi();
-                showTraktStatus('Opening Trakt sign in…');
-                showTraktHint('A secure pop-up will appear. Approve access in Trakt and this page will update automatically.');
+                showTraktStatus('Requesting a sign-in code from Trakt…');
+                showTraktHint('');
+                // Open the tab now, while the click still counts as a user gesture;
+                // pop-up blockers refuse window.open once the fetch below has awaited.
+                const activateTab = window.open('about:blank', '_blank');
+                if (activateTab) {
+                    activateTab.opener = null;
+                }
+                const closeActivateTab = () => {
+                    if (activateTab && !activateTab.closed) {
+                        activateTab.close();
+                    }
+                };
                 try {
-                    const response = await fetch('/api/trakt/login-url', { method: 'POST' });
+                    const response = await fetch('/api/trakt/device/code', { method: 'POST' });
                     const payload = await response.json().catch(() => ({}));
-                    if (!response.ok || !payload.url) {
-                        traktPending = false;
-                        updateTraktUi();
+                    if (!response.ok || !payload.session) {
+                        closeActivateTab();
+                        stopTraktDevice();
                         showTraktStatus(resolveErrorMessage(payload) || 'Unable to start Trakt sign in.', 'error');
                         showTraktHint('Please try again in a moment.');
                         return;
                     }
-                    const popup = window.open(payload.url, 'trakt-sign-in', 'width=600,height=780');
-                    if (!popup) {
-                        traktPending = false;
-                        updateTraktUi();
-                        showTraktStatus('Allow pop-ups for this site to continue with Trakt sign in.', 'error');
-                        showTraktHint('After enabling pop-ups, click “Sign in with Trakt” again.');
-                        return;
+                    traktDevice = {
+                        session: payload.session,
+                        intervalMs: Math.max(1, Number(payload.interval) || 5) * 1000,
+                        timer: null,
+                    };
+                    const verificationUrl = payload.verification_url || 'https://auth.trakt.tv/activate';
+                    const userCode = payload.user_code || '';
+                    let activateUrl = verificationUrl;
+                    try {
+                        const prefilled = new URL(verificationUrl);
+                        prefilled.searchParams.set('user_code', userCode);
+                        activateUrl = prefilled.toString();
+                    } catch (err) {
+                        console.warn('Unable to prefill the Trakt activation code', err);
                     }
-                    popup.focus();
+                    traktDeviceLink.href = activateUrl;
+                    traktDeviceLink.textContent = verificationUrl.replace(/^https?:[/][/]/, '');
+                    traktDeviceCode.textContent = userCode;
+                    traktDeviceBlock.classList.remove('hidden');
+                    if (activateTab && !activateTab.closed) {
+                        activateTab.location.href = activateUrl;
+                    }
+                    showTraktStatus('Waiting for you to approve access on Trakt…');
+                    showTraktHint(activateTab
+                        ? 'Trakt opened in a new tab with your code filled in. This page updates automatically once you approve.'
+                        : 'This page updates automatically once you approve.');
+                    scheduleTraktPoll();
                 } catch (error) {
                     console.error(error);
-                    traktPending = false;
-                    updateTraktUi();
+                    closeActivateTab();
+                    stopTraktDevice();
                     showTraktStatus('Could not reach the server to start Trakt sign in.', 'error');
                     showTraktHint('Check your connection and try again.');
                 }
             });
+
+            function scheduleTraktPoll() {
+                if (!traktDevice) {
+                    return;
+                }
+                const device = traktDevice;
+                device.timer = setTimeout(() => {
+                    void pollTraktDevice(device);
+                }, device.intervalMs);
+            }
+
+            async function pollTraktDevice(device) {
+                if (traktDevice !== device) {
+                    return;
+                }
+                let response;
+                let payload;
+                try {
+                    response = await fetch('/api/trakt/device/token', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session: device.session }),
+                    });
+                    payload = await response.json().catch(() => ({}));
+                } catch (error) {
+                    console.error(error);
+                    scheduleTraktPoll();
+                    return;
+                }
+                if (traktDevice !== device) {
+                    return;
+                }
+                if (response.ok && payload.status === 'slow_down') {
+                    device.intervalMs += 1000;
+                }
+                if (response.ok && (payload.status === 'pending' || payload.status === 'slow_down')) {
+                    scheduleTraktPoll();
+                    return;
+                }
+                stopTraktDevice();
+                if (response.ok && payload.status === 'success') {
+                    applyTraktTokens(payload.tokens || {}, { silent: true });
+                    if (traktAuth.accessToken) {
+                        refreshTraktMessaging();
+                        void fetchProfileStatus({ useConfig: true });
+                        return;
+                    }
+                }
+                showTraktStatus(resolveErrorMessage(payload) || 'Trakt rejected the sign in request.', 'error');
+                showTraktHint('Click “Sign in with Trakt” to get a new code.');
+            }
+
+            function stopTraktDevice() {
+                if (traktDevice && traktDevice.timer) {
+                    clearTimeout(traktDevice.timer);
+                }
+                traktDevice = null;
+                traktPending = false;
+                traktDeviceBlock.classList.add('hidden');
+                updateTraktUi();
+            }
 
             traktDisconnectButton.addEventListener('click', () => {
                 if (traktPending) {
@@ -939,6 +1038,8 @@ CONFIG_TEMPLATE = dedent(
                 }
                 traktAuth.accessToken = '';
                 traktAuth.refreshToken = '';
+                traktAuth.createdAt = 0;
+                traktAuth.expiresIn = 0;
                 persistTraktTokens(null);
                 updateManifestPreview();
                 updateTraktUi();
@@ -946,106 +1047,7 @@ CONFIG_TEMPLATE = dedent(
                 showTraktHint('');
             });
 
-            let traktBroadcastChannel = null;
-
-            function normalizeTraktOauthPayload(rawPayload) {
-                if (rawPayload == null) {
-                    return null;
-                }
-                let data = rawPayload;
-                if (typeof data === 'string') {
-                    try {
-                        data = JSON.parse(data);
-                    } catch (err) {
-                        console.warn('Ignoring malformed Trakt OAuth payload', err);
-                        return null;
-                    }
-                }
-                if (!data || typeof data !== 'object') {
-                    return null;
-                }
-                if (data.source === 'trakt-oauth') {
-                    if (!data.tokens && (data.access_token || data.refresh_token)) {
-                        data.tokens = {
-                            access_token: data.access_token || data.accessToken || '',
-                            refresh_token: data.refresh_token || data.refreshToken || '',
-                        };
-                    }
-                    return data;
-                }
-                const type = typeof data.type === 'string' ? data.type.toUpperCase() : '';
-                if (type === 'TRAKT_AUTH_SUCCESS') {
-                    const tokens = {
-                        access_token: data.access_token || data.accessToken || '',
-                        refresh_token: data.refresh_token || data.refreshToken || '',
-                    };
-                    if (data.expires_in != null) {
-                        tokens.expires_in = data.expires_in;
-                    }
-                    if (data.scope) {
-                        tokens.scope = data.scope;
-                    }
-                    if (data.token_type) {
-                        tokens.token_type = data.token_type;
-                    }
-                    return {
-                        source: 'trakt-oauth',
-                        status: 'success',
-                        tokens,
-                    };
-                }
-                if (type === 'TRAKT_AUTH_ERROR') {
-                    return {
-                        source: 'trakt-oauth',
-                        status: 'error',
-                        error: data.error || data.message || 'trakt_error',
-                        error_description: data.error_description || data.description || '',
-                    };
-                }
-                return null;
-            }
-
-            function handleTraktOauthPayload(rawPayload, origin) {
-                const data = normalizeTraktOauthPayload(rawPayload);
-                if (!data || data.source !== 'trakt-oauth') {
-                    return;
-                }
-                if (origin && !traktOrigins.includes(origin)) {
-                    return;
-                }
-                traktPending = false;
-                applyTraktTokens(data.tokens || {}, { silent: true });
-                updateTraktUi();
-                if (data.status === 'success' && traktAuth.accessToken) {
-                    refreshTraktMessaging();
-                    void fetchProfileStatus({ useConfig: true });
-                } else if (data.status === 'success') {
-                    showTraktStatus('Trakt did not return an access token. Please try again.', 'error');
-                    showTraktHint('Approve the access request in the Trakt window to finish linking.');
-                } else {
-                    showTraktStatus(
-                        data.error_description || data.error || 'Trakt rejected the sign in request.',
-                        'error'
-                    );
-                    showTraktHint('Try again and ensure you approve the request in Trakt.');
-                }
-            }
-
-            window.addEventListener('message', (event) => {
-                handleTraktOauthPayload(event.data, event.origin || '');
-            });
-
-            if ('BroadcastChannel' in window) {
-                traktBroadcastChannel = new BroadcastChannel('aiopicks.trakt-oauth');
-                traktBroadcastChannel.addEventListener('message', (event) => {
-                    handleTraktOauthPayload(event.data, '');
-                });
-            }
-
             window.addEventListener('beforeunload', () => {
-                if (traktBroadcastChannel) {
-                    traktBroadcastChannel.close();
-                }
                 stopStatusPolling();
             });
 
@@ -1267,7 +1269,16 @@ CONFIG_TEMPLATE = dedent(
                     generationRetryLimit: Number.isFinite(retryLimit) && retryLimit >= 0 ? retryLimit : 0,
                     traktHistoryLimit: Number.isFinite(historyLimit) && historyLimit > 0 ? historyLimit : 0,
                     traktHistory: history,
+                    traktTokenExpiresAt: typeof raw.traktTokenExpiresAt === 'string' ? raw.traktTokenExpiresAt : '',
                 };
+            }
+
+            function traktSignInExpired() {
+                if (!traktAuth.accessToken || !profileStatus || !profileStatus.traktTokenExpiresAt) {
+                    return false;
+                }
+                const expiresAt = Date.parse(profileStatus.traktTokenExpiresAt);
+                return Number.isFinite(expiresAt) && expiresAt <= Date.now();
             }
 
             function collectManifestSettings() {
@@ -1285,6 +1296,9 @@ CONFIG_TEMPLATE = dedent(
                     refreshInterval: refreshSelect.value,
                     cacheTtl: cacheSelect.value,
                     traktAccessToken: traktAuth.accessToken,
+                    traktRefreshToken: traktAuth.refreshToken,
+                    traktTokenCreatedAt: traktAuth.createdAt,
+                    traktTokenExpiresIn: traktAuth.expiresIn,
                 };
             }
 
@@ -1321,7 +1335,13 @@ CONFIG_TEMPLATE = dedent(
                 }
                 if (settings.refreshInterval) payload.refreshInterval = Number(settings.refreshInterval);
                 if (settings.cacheTtl) payload.cacheTtl = Number(settings.cacheTtl);
-                if (settings.traktAccessToken) payload.traktAccessToken = settings.traktAccessToken;
+                if (settings.traktAccessToken) {
+                    payload.traktAccessToken = settings.traktAccessToken;
+                    // Lets the server renew the sign-in and ignore this copy once it has.
+                    if (settings.traktRefreshToken) payload.traktRefreshToken = settings.traktRefreshToken;
+                    if (settings.traktTokenCreatedAt) payload.traktTokenCreatedAt = settings.traktTokenCreatedAt;
+                    if (settings.traktTokenExpiresIn) payload.traktTokenExpiresIn = settings.traktTokenExpiresIn;
+                }
                 if (settings.metadataAddon) payload.metadataAddon = settings.metadataAddon;
                 return payload;
             }
@@ -1446,6 +1466,9 @@ CONFIG_TEMPLATE = dedent(
                     updateManifestUi();
                     updateManifestStatus();
                     updateTraktStats();
+                    if (!traktPending && traktSignInExpired()) {
+                        refreshTraktMessaging();
+                    }
                     return profileStatus;
                 } catch (error) {
                     console.error(error);
@@ -1719,7 +1742,7 @@ CONFIG_TEMPLATE = dedent(
             function refreshTraktMessaging() {
                 if (!traktLoginAvailable) {
                     showTraktStatus(
-                        'Server is not configured with Trakt credentials. Ask the administrator to set TRAKT_CLIENT_ID and TRAKT_CLIENT_SECRET.',
+                        'Server is not configured with Trakt credentials. Ask the administrator to set TRAKT_CLIENT_ID.',
                         'error'
                     );
                     showTraktHint('');
@@ -1730,27 +1753,41 @@ CONFIG_TEMPLATE = dedent(
                     showTraktHint('');
                     return;
                 }
+                if (traktSignInExpired()) {
+                    showTraktStatus('Your Trakt sign-in has expired. Sign in again to keep your catalogs personalised.', 'error');
+                    showTraktHint('Disconnect, then click “Sign in with Trakt”. Your Stremio link stays the same.');
+                    return;
+                }
                 if (traktAuth.accessToken) {
                     showTraktStatus('Trakt connected! Manifest links now include your access token automatically.', 'success');
                     if (traktAuth.refreshToken) {
-                        showTraktHint('Your tokens are stored locally in this browser so you stay signed in next time.');
+                        showTraktHint('The server renews your Trakt sign-in automatically, so your Stremio link keeps working.');
                     } else {
                         showTraktHint('Your access token is stored locally in this browser for manifest generation.');
                     }
                     return;
                 }
                 showTraktStatus('Sign in to Trakt to unlock personalised recommendations.');
-                showTraktHint('A secure pop-up will open and you simply approve access—no codes required.');
+                showTraktHint('You will get a short code to enter at trakt.tv/activate.');
             }
 
             function applyTraktTokens(tokens, options = {}) {
                 const access = ((tokens && (tokens.access_token || tokens.accessToken)) || '').trim();
                 const refresh = ((tokens && (tokens.refresh_token || tokens.refreshToken)) || '').trim();
+                const createdAt = access ? Number(tokens.created_at || tokens.createdAt) || 0 : 0;
+                const expiresIn = access ? Number(tokens.expires_in || tokens.expiresIn) || 0 : 0;
                 const previousAccess = traktAuth.accessToken;
                 const previousRefresh = traktAuth.refreshToken;
                 traktAuth.accessToken = access;
                 traktAuth.refreshToken = refresh;
-                persistTraktTokens(access ? { access_token: access, refresh_token: refresh } : null);
+                traktAuth.createdAt = createdAt;
+                traktAuth.expiresIn = expiresIn;
+                persistTraktTokens(access ? {
+                    access_token: access,
+                    refresh_token: refresh,
+                    created_at: createdAt,
+                    expires_in: expiresIn,
+                } : null);
                 if (previousAccess !== access || previousRefresh !== refresh) {
                     markProfileDirty();
                 }
@@ -1833,19 +1870,8 @@ CONFIG_TEMPLATE = dedent(
 )
 
 
-def render_config_page(settings: Settings, *, callback_origin: str = "") -> str:
+def render_config_page(settings: Settings) -> str:
     """Return the full HTML for the `/config` landing page."""
-
-    resolved_callback_origin = ""
-    candidate_origin = callback_origin.strip()
-    if candidate_origin:
-        resolved_callback_origin = candidate_origin.rstrip("/")
-    elif settings.trakt_redirect_uri:
-        parsed = urlparse(str(settings.trakt_redirect_uri))
-        if parsed.scheme and parsed.netloc:
-            resolved_callback_origin = (
-                f"{parsed.scheme}://{parsed.netloc}"
-            ).rstrip("/")
 
     defaults = {
         "appName": settings.app_name,
@@ -1860,10 +1886,7 @@ def render_config_page(settings: Settings, *, callback_origin: str = "") -> str:
         "refreshIntervalSeconds": settings.refresh_interval_seconds,
         "responseCacheSeconds": settings.response_cache_seconds,
         "traktAccessToken": settings.trakt_access_token or "",
-        "traktLoginAvailable": bool(
-            settings.trakt_client_id and settings.trakt_client_secret
-        ),
-        "traktCallbackOrigin": resolved_callback_origin,
+        "traktLoginAvailable": bool(settings.trakt_client_id),
         "metadataAddon": (
             str(settings.metadata_addon_url) if settings.metadata_addon_url else ""
         ),

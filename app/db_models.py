@@ -27,6 +27,13 @@ class Profile(Base):
     openai_model: Mapped[str] = mapped_column(String(200), default="")
     trakt_client_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     trakt_access_token: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    trakt_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trakt_token_issued_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    trakt_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     trakt_history_limit: Mapped[int] = mapped_column(Integer, default=0)
     trakt_movie_history_count: Mapped[int] = mapped_column(Integer, default=0)
     trakt_show_history_count: Mapped[int] = mapped_column(Integer, default=0)

@@ -117,6 +117,18 @@ class Database:
             "openai_model",
             "ALTER TABLE profiles ADD COLUMN openai_model VARCHAR(200) DEFAULT ''",
         )
+        _ensure_column(
+            "trakt_refresh_token",
+            "ALTER TABLE profiles ADD COLUMN trakt_refresh_token TEXT",
+        )
+        _ensure_column(
+            "trakt_token_issued_at",
+            "ALTER TABLE profiles ADD COLUMN trakt_token_issued_at DATETIME",
+        )
+        _ensure_column(
+            "trakt_token_expires_at",
+            "ALTER TABLE profiles ADD COLUMN trakt_token_expires_at DATETIME",
+        )
 
     async def dispose(self) -> None:
         """Dispose of the underlying database engine."""

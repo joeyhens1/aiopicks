@@ -64,7 +64,7 @@ AIOPicks currently generates 20 fixed lanes. Movies and series are requested sep
 ## 🛠️ Prerequisites
 
 - Python 3.10+
-- A Trakt application (client ID/secret) and an access token with history scope
+- A Trakt application (client ID only). Sign in uses Trakt's device-code flow — you enter a short code at trakt.tv/activate — so no client secret or reachable redirect URI is needed. Set `TRAKT_REDIRECT_URI` to the Redirect URI shown on your Trakt app: the server renews each sign-in automatically before its 7-day expiry, and Trakt checks that value when it does.
 - An OpenRouter API key (optional if you use Local mode)
 - (Recommended) A Cinemeta-compatible metadata endpoint, e.g. `https://v3-cinemeta.strem.io`
 - (Optional) Docker if you prefer container deployment
@@ -73,7 +73,7 @@ AIOPicks currently generates 20 fixed lanes. Movies and series are requested sep
 
 1. Copy `.env.sample` to `.env` and fill in your credentials. Only the variables listed below are currently used by the application.
 2. Provide the minimum secrets:
-   - Local mode (no AI accounts): `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, and a long-lived `TRAKT_ACCESS_TOKEN`
+   - Local mode (no AI accounts): `TRAKT_CLIENT_ID`, then sign in with Trakt from the `/config` page (or set `TRAKT_ACCESS_TOKEN` directly)
    - AI mode: add `OPENROUTER_API_KEY` (and optionally choose a different `OPENROUTER_MODEL`)
 3. Optional but recommended settings:
    - `OPENROUTER_MODEL` (defaults to `google/gemini-2.5-flash-lite`)
@@ -101,7 +101,7 @@ Open `http://localhost:3000/config` after the server starts to:
 
 - Verify your environment configuration and profile status
 - Trigger catalog generation (`Force refresh`)
-- Launch the Trakt OAuth helper if you prefer short-lived tokens
+- Sign in with Trakt (the server renews the sign-in automatically)
 - Choose the discovery engine (AI via OpenRouter or Local offline). In Local mode, OpenRouter fields are hidden.
 
 ### Local mode at a glance (no AI accounts)
@@ -141,6 +141,17 @@ docker compose up -d --build
 
 This builds the image, starts the `aiopicks` service, and pulls environment variables from `.env`. Check `http://localhost:3000/config` for status, tail logs with `docker compose logs -f aiopicks`, and stop everything with `docker compose down`.
 
+### Changing Trakt settings
+
+`TRAKT_CLIENT_ID` and `TRAKT_REDIRECT_URI` are read once at startup, so after editing `.env`, recreate the container (a plain `docker compose restart` does not reload `.env`):
+
+```bash
+docker compose up -d
+```
+
+- **Redirect URI changed on the same Trakt app:** update `TRAKT_REDIRECT_URI` to match exactly. Existing sign-ins keep working and renew with the new value.
+- **Switched to a different Trakt app (new client ID):** existing sign-ins belong to the old app and will likely stop renewing, so they lapse when their 7-day token runs out. Each user should open `/config`, click **Disconnect**, then **Sign in with Trakt**. Their profile and Stremio link stay the same.
+
 ### Manual Docker commands
 
 ```bash
@@ -172,8 +183,8 @@ docker run -d \
 | `/config` | GET | Interactive configuration UI, including Trakt sign-in and manual refresh controls. |
 | `/api/profile/status` | GET | Inspect or resolve profile state (used by the config UI). |
 | `/api/profile/prepare` | POST | Trigger catalog generation; supports `force` and `waitForCompletion`. |
-| `/api/trakt/login-url` | POST | Start the Trakt OAuth authorisation flow for the config UI helper. |
-| `/api/trakt/callback` | GET | OAuth redirect handler that relays tokens back to the config page. |
+| `/api/trakt/device/code` | POST | Start a Trakt device-code sign-in; returns the code to enter at `auth.trakt.tv/activate`. |
+| `/api/trakt/device/token` | POST | Poll a pending sign-in; returns the tokens once the user approves on Trakt. |
 | `/healthz` | GET | Lightweight readiness probe. |
 
 ## ⚠️ Disclaimer

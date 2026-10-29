@@ -1,7 +1,7 @@
 services:
   aiopicks:
     build:
-      context: https://github.com/qooode/aiopicks
+      context: .
     image: aiopicks:latest
     ports:
       - "3000:3000"
@@ -9,4 +9,10 @@ services:
       - .env
     environment:
       - ENVIRONMENT=production
+      - DATABASE_URL=sqlite+aiosqlite:////data/aiopicks.db
+    volumes:
+      - aiopicks-data:/data
     restart: unless-stopped
+
+volumes:
+  aiopicks-data:

@@ -28,12 +28,11 @@ class Settings(BaseSettings):
     server_port: int = Field(default=3000, alias="PORT")
 
     trakt_client_id: str | None = Field(default=None, alias="TRAKT_CLIENT_ID")
-    trakt_client_secret: str | None = Field(
-        default=None, alias="TRAKT_CLIENT_SECRET"
-    )
     trakt_access_token: str | None = Field(default=None, alias="TRAKT_ACCESS_TOKEN")
-    trakt_redirect_uri: HttpUrl | None = Field(
-        default=None, alias="TRAKT_REDIRECT_URI"
+    # Sign in never redirects, but Trakt checks this against the app's
+    # Redirect URI when renewing a sign-in, so it must match exactly.
+    trakt_redirect_uri: str = Field(
+        default="urn:ietf:wg:oauth:2.0:oob", alias="TRAKT_REDIRECT_URI"
     )
     trakt_history_limit: int = Field(
         default=0, alias="TRAKT_HISTORY_LIMIT", ge=0, le=10_000
@@ -78,8 +77,8 @@ class Settings(BaseSettings):
     trakt_api_url: HttpUrl = Field(
         default="https://api.trakt.tv", alias="TRAKT_API_URL"
     )
-    trakt_authorize_url: HttpUrl = Field(
-        default="https://trakt.tv/oauth/authorize", alias="TRAKT_AUTHORIZE_URL"
+    trakt_auth_url: HttpUrl = Field(
+        default="https://auth.trakt.tv", alias="TRAKT_AUTH_URL"
     )
     openrouter_api_url: HttpUrl = Field(
         default="https://openrouter.ai/api/v1", alias="OPENROUTER_API_URL"
